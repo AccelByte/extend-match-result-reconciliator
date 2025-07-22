@@ -35,13 +35,13 @@ func GetEnvInt(key string, fallback int) int {
 	return val
 }
 
-func GetCollectorBasePath() string {
-	basePath := os.Getenv("COLLECTOR_BASE_PATH")
+func GetBasePath() string {
+	basePath := os.Getenv("BASE_PATH")
 	if basePath == "" {
-		logrus.Fatalf("COLLECTOR_BASE_PATH envar is not set or empty")
+		logrus.Fatalf("BASE_PATH envar is not set or empty")
 	}
 	if !strings.HasPrefix(basePath, "/") {
-		logrus.Fatalf("COLLECTOR_BASE_PATH envar is invalid, no leading '/' found. Valid example: /basePath")
+		logrus.Fatalf("BASE_PATH envar is invalid, no leading '/' found. Valid example: /basePath")
 	}
 
 	return basePath
@@ -113,16 +113,4 @@ func InjectTraceContextIntoKafkaHeaders(ctx context.Context, headers *[]kafka.He
 
 	// Update the original headers slice with the modified carrier
 	*headers = []kafka.Header(carrier)
-}
-
-func GetBasePath() string {
-	basePath := os.Getenv("BASE_PATH")
-	if basePath == "" {
-		logrus.Fatalf("BASE_PATH envar is not set or empty")
-	}
-	if !strings.HasPrefix(basePath, "/") {
-		logrus.Fatalf("BASE_PATH envar is invalid, no leading '/' found. Valid example: /basePath")
-	}
-
-	return basePath
 }
