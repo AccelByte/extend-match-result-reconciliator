@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"extend-match-result-reconciliator/pkg/common"
+	"extend-match-result-reconciliator/pkg/pb"
 	"fmt"
 	"strings"
 	"time"
@@ -120,6 +121,7 @@ var (
 
 // Service implements the reconciliator service
 type Service struct {
+	pb.UnimplementedServiceServer
 	logger      *logrus.Logger
 	kafkaReader *kafka.Reader
 	redisClient *redis.Client
@@ -219,16 +221,21 @@ func (s *Service) initKafkaReader() *kafka.Reader {
 		return nil
 	}
 
-	mechanism, err := scram.Mechanism(scram.SHA512, username, password)
-	if err != nil {
-		s.logger.WithError(err).Fatal("Failed to create SASL SCRAM mechanism")
+	dialer := &kafka.Dialer{
+		Timeout:   10 * time.Second,
+		DualStack: true,
 	}
 
-	dialer := &kafka.Dialer{
-		Timeout:       10 * time.Second,
-		DualStack:     true,
-		TLS:           &tls.Config{InsecureSkipVerify: true},
-		SASLMechanism: mechanism,
+	if username != "" && password != "" {
+		mechanism, err := scram.Mechanism(scram.SHA512, username, password)
+		if err != nil {
+			s.logger.WithError(err).Fatal("Failed to create SASL SCRAM mechanism")
+		}
+		dialer.SASLMechanism = mechanism
+		dialer.TLS = &tls.Config{InsecureSkipVerify: true}
+		s.logger.Info("Kafka reader configured with SASL authentication")
+	} else {
+		s.logger.Info("Kafka reader configured without authentication")
 	}
 
 	return kafka.NewReader(kafka.ReaderConfig{
@@ -1360,22 +1367,25 @@ func (s *Service) Stop() error {
 	return nil
 }
 
-// HealthCheck returns the health status of the service
-func (s *Service) HealthCheck() error {
+// GetHealth returns the health status of the service
+func (s *Service) GetHealth(ctx context.Context, req *pb.GetHealthRequest) (*pb.GetHealthResponse, error) {
 	tracer := otel.Tracer("reconciliator")
-	ctx := context.Background()
 
 	_, span := tracer.Start(ctx, "health_check")
 	defer span.End()
 
 	// Check Redis connection
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
 	if err := s.redisClient.Ping(ctx).Err(); err != nil {
 		span.RecordError(err)
-		return fmt.Errorf("redis health check failed: %w", err)
+		return &pb.GetHealthResponse{
+			Status: "error",
+		}, fmt.Errorf("redis health check failed: %w", err)
 	}
 
-	return nil
+	return &pb.GetHealthResponse{
+		Status: "ok",
+	}, nil
 }

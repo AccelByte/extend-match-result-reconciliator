@@ -1,68 +1,197 @@
-// Copyright (c) 2023 AccelByte Inc. All Rights Reserved.
+// Copyright (c) 2023-2025 AccelByte Inc. All Rights Reserved.
 // This is licensed software from AccelByte Inc, for limitations
 // and restrictions contact your company contract manager.
 
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"extend-match-result-reconciliator/pkg/common"
+	"extend-match-result-reconciliator/pkg/pb"
+	"extend-match-result-reconciliator/pkg/service"
 	"fmt"
+	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
-	"extend-match-result-reconciliator/pkg/common"
-	"extend-match-result-reconciliator/pkg/service"
-
+	"github.com/AccelByte/accelbyte-go-sdk/services-api/pkg/factory"
+	"github.com/AccelByte/accelbyte-go-sdk/services-api/pkg/repository"
+	"github.com/AccelByte/accelbyte-go-sdk/services-api/pkg/service/iam"
+	sdkAuth "github.com/AccelByte/accelbyte-go-sdk/services-api/pkg/utils/auth"
+	"github.com/go-openapi/loads"
+	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/logging"
+	prometheusGrpc "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/prometheus/client_golang/prometheus"
 	prometheusCollectors "github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/contrib/propagators/b3"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/reflection"
+)
+
+const (
+	metricsEndpoint     = "/metrics"
+	metricsPort         = 8080
+	grpcServerPort      = 6565
+	grpcGatewayHTTPPort = 8000
 )
 
 var (
-	reconciliatorServiceName = common.GetEnv("RECONCILIATOR_SERVICE_NAME", "ExtendMatchResultReconciliator")
+	serviceName = common.GetEnv("OTEL_SERVICE_NAME", "ExtendMatchResultReconciliator")
+	logLevelStr = common.GetEnv("LOG_LEVEL", logrus.InfoLevel.String())
+	basePath    = common.GetBasePath()
 )
 
 func main() {
+	logrus.Infof("Starting %s...", serviceName)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Load configuration
 	config, err := service.LoadConfig()
 	if err != nil {
 		logrus.WithError(err).Fatal("Failed to load configuration")
 	}
 
-	// Initialize logger
-	logger := setupLogger(config)
+	logrusLevel, err := logrus.ParseLevel(logLevelStr)
+	if err != nil {
+		logrusLevel = logrus.InfoLevel
+	}
+	logrusLogger := logrus.New()
+	logrusLogger.SetLevel(logrusLevel)
 
-	logger.WithFields(logrus.Fields{
-		"service":     config.Service.Name,
-		"version":     config.Service.Version,
-		"environment": config.Service.Environment,
-	}).Info("Starting reconciliator service")
+	loggingOptions := []logging.Option{
+		logging.WithLogOnEvents(logging.StartCall, logging.FinishCall, logging.PayloadReceived, logging.PayloadSent),
+		logging.WithFieldsFromContext(func(ctx context.Context) logging.Fields {
+			if span := trace.SpanContextFromContext(ctx); span.IsSampled() {
+				return logging.Fields{"traceID", span.TraceID().String()}
+			}
 
-	// Print configuration (without sensitive data)
-	printConfiguration(config, logger)
+			return nil
+		}),
+		logging.WithLevels(logging.DefaultClientCodeToLevel),
+		logging.WithDurationField(logging.DurationToDurationField),
+	}
 
-	// Set up OpenTelemetry
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	unaryServerInterceptors := []grpc.UnaryServerInterceptor{
+		prometheusGrpc.UnaryServerInterceptor,
+		logging.UnaryServerInterceptor(common.InterceptorLogger(logrusLogger), loggingOptions...),
+	}
+	streamServerInterceptors := []grpc.StreamServerInterceptor{
+		prometheusGrpc.StreamServerInterceptor,
+		logging.StreamServerInterceptor(common.InterceptorLogger(logrusLogger), loggingOptions...),
+	}
+
+	// Preparing the IAM authorization
+	var tokenRepo repository.TokenRepository = sdkAuth.DefaultTokenRepositoryImpl()
+	var configRepo repository.ConfigRepository = sdkAuth.DefaultConfigRepositoryImpl()
+	var refreshRepo repository.RefreshTokenRepository = &sdkAuth.RefreshTokenImpl{RefreshRate: 1.0, AutoRefresh: true}
+
+	oauthService := iam.OAuth20Service{
+		Client:                 factory.NewIamClient(configRepo),
+		TokenRepository:        tokenRepo,
+		RefreshTokenRepository: refreshRepo,
+		ConfigRepository:       configRepo,
+	}
+
+	if strings.ToLower(common.GetEnv("PLUGIN_GRPC_SERVER_AUTH_ENABLED", "true")) == "true" {
+		refreshInterval := common.GetEnvInt("REFRESH_INTERVAL", 600)
+		common.Validator = common.NewTokenValidator(oauthService, time.Duration(refreshInterval)*time.Second, true)
+		common.Validator.Initialize(ctx)
+
+		permissionExtractor := common.NewProtoPermissionExtractor()
+		unaryServerInterceptor := common.NewUnaryAuthServerIntercept(permissionExtractor)
+		serverServerInterceptor := common.NewStreamAuthServerIntercept(permissionExtractor)
+
+		unaryServerInterceptors = append(unaryServerInterceptors, unaryServerInterceptor)
+		streamServerInterceptors = append(streamServerInterceptors, serverServerInterceptor)
+		logrus.Infof("added auth interceptors")
+	}
+
+	// Create gRPC Server
+	s := grpc.NewServer(
+		grpc.StatsHandler(otelgrpc.NewServerHandler()),
+		grpc.ChainUnaryInterceptor(unaryServerInterceptors...),
+		grpc.ChainStreamInterceptor(streamServerInterceptors...),
+	)
+
+	// Configure IAM authorization
+	clientId := configRepo.GetClientId()
+	clientSecret := configRepo.GetClientSecret()
+	err = oauthService.LoginClient(&clientId, &clientSecret)
+	if err != nil {
+		logrus.Fatalf("Error unable to login using clientId and clientSecret: %v", err)
+	}
+
+	// Register Guild Service
+	myServiceServer := service.NewService(logrusLogger, config)
+	pb.RegisterServiceServer(s, myServiceServer)
+
+	// Enable gRPC Reflection
+	reflection.Register(s)
+
+	// Enable gRPC Health Check
+	grpc_health_v1.RegisterHealthServer(s, health.NewServer())
+
+	// Create a new HTTP server for the gRPC-Gateway
+	grpcGateway, err := common.NewGateway(ctx, fmt.Sprintf("localhost:%d", grpcServerPort), basePath)
+	if err != nil {
+		logrus.Fatalf("Failed to create gRPC-Gateway: %v", err)
+	}
+
+	// Start the gRPC-Gateway HTTP server
+	go func() {
+		swaggerDir := "gateway/apidocs" // Path to swagger directory
+		grpcGatewayHTTPServer := newGRPCGatewayHTTPServer(fmt.Sprintf(":%d", grpcGatewayHTTPPort), grpcGateway, logrus.New(), swaggerDir)
+		logrus.Infof("Starting gRPC-Gateway HTTP server on port %d", grpcGatewayHTTPPort)
+		if err := grpcGatewayHTTPServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logrus.Fatalf("Failed to run gRPC-Gateway HTTP server: %v", err)
+		}
+	}()
+
+	prometheusGrpc.Register(s)
+
+	// Register Prometheus Metrics
+	prometheusRegistry := prometheus.NewRegistry()
+	prometheusRegistry.MustRegister(
+		prometheusCollectors.NewGoCollector(),
+		prometheusCollectors.NewProcessCollector(prometheusCollectors.ProcessCollectorOpts{}),
+		prometheusGrpc.DefaultServerMetrics,
+	)
+
+	go func() {
+		http.Handle(metricsEndpoint, promhttp.HandlerFor(prometheusRegistry, promhttp.HandlerOpts{}))
+		logrus.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", metricsPort), nil))
+	}()
+	logrus.Infof("Metrics endpoint: (:%d%s)", metricsPort, metricsEndpoint)
 
 	// Set Tracer Provider
-	tracerProvider, err := common.NewTracerProvider(reconciliatorServiceName)
+	tracerProvider, err := common.NewTracerProvider(serviceName)
 	if err != nil {
-		logger.Fatalf("Failed to create tracer provider: %v", err)
+		logrus.Fatalf("Failed to create tracer provider: %v", err)
+
+		return
 	}
 	otel.SetTracerProvider(tracerProvider)
 	defer func(ctx context.Context) {
 		if err := tracerProvider.Shutdown(ctx); err != nil {
-			logger.Fatal(err)
+			logrus.Fatal(err)
 		}
 	}(ctx)
 
@@ -75,160 +204,119 @@ func main() {
 		),
 	)
 
-	// Create reconciliator service
-	reconciliatorService := service.NewService(logger, config)
+	// Start gRPC Server
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", grpcServerPort))
+	if err != nil {
+		logrus.Fatalf("Failed to listen to tcp:%d: %v", grpcServerPort, err)
 
-	// Setup HTTP server for health checks with OTel instrumentation
-	healthServer := setupHealthServer(reconciliatorService, logger)
-
-	// Start the service
-	if err := reconciliatorService.Start(); err != nil {
-		logger.WithError(err).Fatal("Failed to start reconciliator service")
+		return
 	}
-
-	// Start health check server
 	go func() {
-		logger.Info("Starting health check server on :8080")
-		logger.Infof("Metrics endpoint: (:8080/metrics)")
-		if err := healthServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			logger.WithError(err).Error("Health check server failed")
+		if err = s.Serve(lis); err != nil {
+			logrus.Fatalf("Failed to run gRPC server: %v", err)
+
+			return
 		}
 	}()
 
-	// Wait for interrupt signal
-	waitForShutdown(reconciliatorService, healthServer, config, logger)
-}
-
-// setupLogger configures the logger based on configuration
-func setupLogger(config *service.Config) *logrus.Logger {
-	logger := logrus.New()
-
-	// Set log level
-	level, err := logrus.ParseLevel(config.Log.Level)
+	err = myServiceServer.Start()
 	if err != nil {
-		logger.WithError(err).Warn("Invalid log level, using info")
-		level = logrus.InfoLevel
-	}
-	logger.SetLevel(level)
-
-	// Set log format
-	if config.Log.Format == "json" {
-		logger.SetFormatter(&logrus.JSONFormatter{
-			TimestampFormat: time.RFC3339,
-		})
-	} else {
-		logger.SetFormatter(&logrus.TextFormatter{
-			FullTimestamp:   true,
-			TimestampFormat: time.RFC3339,
-		})
+		logrus.Fatalf("Failed to start service: %v", err)
 	}
 
-	return logger
+	logrus.Infof("%s started", serviceName)
+
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	<-ctx.Done()
+	logrus.Infof("SIGTERM received")
 }
 
-// printConfiguration prints the current configuration (without sensitive data)
-func printConfiguration(config *service.Config, logger *logrus.Logger) {
-	logger.Info("Configuration loaded:")
-	logger.WithFields(logrus.Fields{
-		"kafka_brokers":   config.Kafka.Brokers,
-		"kafka_topic":     config.Kafka.Topic,
-		"kafka_group_id":  config.Kafka.GroupID,
-		"redis_addr":      config.Redis.Addr,
-		"redis_db":        config.Redis.DB,
-		"redis_ttl":       config.Redis.TTL.String(),
-		"log_level":       config.Log.Level,
-		"log_format":      config.Log.Format,
-		"service_name":    config.Service.Name,
-		"service_version": config.Service.Version,
-		"environment":     config.Service.Environment,
-	}).Info("Service configuration")
-}
-
-// setupHealthServer creates an HTTP server for health checks with OTel instrumentation
-func setupHealthServer(service *service.Service, logger *logrus.Logger) *http.Server {
+func newGRPCGatewayHTTPServer(
+	addr string, handler http.Handler, logger *logrus.Logger, swaggerDir string,
+) *http.Server {
+	// Create a new ServeMux
 	mux := http.NewServeMux()
 
-	// Health check endpoint
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		_, span := trace.SpanFromContext(r.Context()).TracerProvider().Tracer("reconciliator").Start(r.Context(), "health_check")
-		defer span.End()
+	// Add the gRPC-Gateway handler
+	mux.Handle("/", handler)
 
-		if err := service.HealthCheck(); err != nil {
-			logger.WithError(err).Error("Health check failed")
-			span.RecordError(err)
-			w.WriteHeader(http.StatusServiceUnavailable)
-			fmt.Fprintf(w, `{"status":"unhealthy","error":"%s"}`, err.Error())
+	// Serve Swagger UI and JSON
+	serveSwaggerUI(mux)
+	serveSwaggerJSON(mux, swaggerDir)
+
+	// Add logging middleware
+	loggedMux := loggingMiddleware(logger, mux)
+
+	return &http.Server{
+		Addr:     addr,
+		Handler:  loggedMux,
+		ErrorLog: log.New(os.Stderr, "httpSrv: ", log.LstdFlags), // Configure the logger for the HTTP server
+	}
+}
+
+// loggingMiddleware is a middleware that logs HTTP requests
+func loggingMiddleware(logger *logrus.Logger, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		duration := time.Since(start)
+		logger.WithFields(logrus.Fields{
+			"method":   r.Method,
+			"path":     r.URL.Path,
+			"duration": duration,
+		}).Info("HTTP request")
+	})
+}
+
+func serveSwaggerUI(mux *http.ServeMux) {
+	swaggerUIDir := "third_party/swagger-ui"
+	fileServer := http.FileServer(http.Dir(swaggerUIDir))
+	swaggerUiPath := fmt.Sprintf("%s/apidocs/", basePath)
+	mux.Handle(swaggerUiPath, http.StripPrefix(swaggerUiPath, fileServer))
+}
+
+func serveSwaggerJSON(mux *http.ServeMux, swaggerDir string) {
+	fileHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		matchingFiles, err := filepath.Glob(filepath.Join(swaggerDir, "*.swagger.json"))
+		if err != nil || len(matchingFiles) == 0 {
+			http.Error(w, "Error finding Swagger JSON file", http.StatusInternalServerError)
+
 			return
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, `{"status":"healthy"}`)
+		firstMatchingFile := matchingFiles[0]
+		swagger, err := loads.Spec(firstMatchingFile)
+		if err != nil {
+			http.Error(w, "Error parsing Swagger JSON file", http.StatusInternalServerError)
+
+			return
+		}
+
+		// Update the base path
+		swagger.Spec().BasePath = basePath
+
+		updatedSwagger, err := swagger.Spec().MarshalJSON()
+		if err != nil {
+			http.Error(w, "Error serializing updated Swagger JSON", http.StatusInternalServerError)
+
+			return
+		}
+		var prettySwagger bytes.Buffer
+		err = json.Indent(&prettySwagger, updatedSwagger, "", "  ")
+		if err != nil {
+			http.Error(w, "Error formatting updated Swagger JSON", http.StatusInternalServerError)
+
+			return
+		}
+
+		_, err = w.Write(prettySwagger.Bytes())
+		if err != nil {
+			http.Error(w, "Error writing Swagger JSON response", http.StatusInternalServerError)
+
+			return
+		}
 	})
-
-	// Ready check endpoint
-	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
-		_, span := trace.SpanFromContext(r.Context()).TracerProvider().Tracer("reconciliator").Start(r.Context(), "ready_check")
-		defer span.End()
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, `{"status":"ready"}`)
-	})
-
-	// Create combined metrics registry
-	combinedRegistry := prometheus.NewRegistry()
-
-	// Register standard collectors
-	combinedRegistry.MustRegister(
-		prometheusCollectors.NewGoCollector(),
-		prometheusCollectors.NewProcessCollector(prometheusCollectors.ProcessCollectorOpts{}),
-	)
-
-	// Register service's custom metrics
-	serviceMetrics := service.GetMetricsRegistry()
-	if serviceMetrics != nil {
-		combinedRegistry.MustRegister(serviceMetrics)
-	}
-
-	// Metrics endpoint with Prometheus handler
-	mux.Handle("/metrics", promhttp.HandlerFor(combinedRegistry, promhttp.HandlerOpts{}))
-
-	// Wrap the mux with OTel HTTP instrumentation
-	otelHandler := otelhttp.NewHandler(mux, "reconciliator_http")
-
-	return &http.Server{
-		Addr:    ":8080",
-		Handler: otelHandler,
-	}
-}
-
-// waitForShutdown waits for interrupt signal and gracefully shuts down the service
-func waitForShutdown(service *service.Service, healthServer *http.Server, config *service.Config, logger *logrus.Logger) {
-	// Create channel to receive OS signals
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	// Wait for signal
-	sig := <-sigChan
-	logger.WithField("signal", sig.String()).Info("Received shutdown signal")
-
-	// Create shutdown context with timeout
-	shutdownTimeout := time.Duration(config.Service.ShutdownTimeout) * time.Second
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancel()
-
-	// Shutdown health server
-	logger.Info("Shutting down health check server...")
-	if err := healthServer.Shutdown(ctx); err != nil {
-		logger.WithError(err).Error("Failed to shutdown health check server")
-	}
-
-	// Shutdown reconciliator service
-	logger.Info("Shutting down reconciliator service...")
-	if err := service.Stop(); err != nil {
-		logger.WithError(err).Error("Failed to shutdown reconciliator service")
-	}
-
-	logger.Info("Reconciliator service shutdown completed")
+	apidocsPath := fmt.Sprintf("%s/apidocs/api.json", basePath)
+	mux.Handle(apidocsPath, fileHandler)
 }

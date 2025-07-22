@@ -1,23 +1,46 @@
 services:
+
+  # Redis service
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+  
   app:
     build: .
     ports:
-      - "6565:6565"
-      - "8080:8080"
-      - "8000:8000"
+      - "6566:6565"
+      - "8081:8080"
+      - "8001:8000"
     environment:
       - AB_CLIENT_ID=${AB_CLIENT_ID}
       - AB_CLIENT_SECRET=${AB_CLIENT_SECRET}
       - AB_BASE_URL=${AB_BASE_URL}
       - AB_NAMESPACE=${AB_NAMESPACE}
-      - PLUGIN_GRPC_SERVER_AUTH_ENABLED
-      - OTEL_EXPORTER_ZIPKIN_ENDPOINT=http://host.docker.internal:9411/api/v2/spans # Zipkin
-      - COLLECTOR_SERVICE_NAME=ExtendServiceExtensionServerGo
-      - COLLECTOR_BASE_PATH
+      - OTEL_EXPORTER_ZIPKIN_ENDPOINT=http://host.docker.internal:9411/api/v2/spansdoc # Zipkin
+      - OTEL_SERVICE_NAME=ExtendMatchResultReconciliator
+      - BASE_PATH=${BASE_PATH}
+      - KAFKA_BROKERS=kafka:19092
+      - REDIS_ADDR=redis:6379
       # - GRPC_GO_LOG_VERBOSITY_LEVEL="99" # enable to debug grpc
       # - GRPC_GO_LOG_SEVERITY_LEVEL=info # enable to debug grpc
     extra_hosts:
       - host.docker.internal:host-gateway
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - default
+      - shared-network
     # logging:
     #   driver: loki
     #   options:
@@ -25,3 +48,11 @@ services:
     #     mode: non-blocking
     #     max-buffer-size: 4m
     #     loki-retries: "3"
+
+volumes:
+  redis_data:
+
+networks:
+  shared-network:
+    external: true
+    name: extend-services-network

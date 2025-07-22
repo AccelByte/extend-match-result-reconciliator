@@ -1,0 +1,62 @@
+// Copyright (c) 2023 AccelByte Inc. All Rights Reserved.
+// This is licensed software from AccelByte Inc, for limitations
+// and restrictions contact your company contract manager.
+
+syntax = "proto3";
+
+option csharp_namespace = "AccelByte.Extend.ServiceExtension";
+option go_package = "extend-match-result/pkg/pb";
+option java_package = "net.accelbyte.extend.serviceextension";
+option java_multiple_files = true;
+
+package service;
+
+import "google/api/annotations.proto";
+import "protoc-gen-openapiv2/options/annotations.proto";
+
+service Service {
+  rpc GetHealth(GetHealthRequest) returns (GetHealthResponse) {
+    option (google.api.http) = {
+      get: "/v1/health"
+    };
+    option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_operation) = {
+      summary: "Get service health status";
+      description: "Returns the health status of the match result reconciliator service";
+      security: {
+        security_requirement: {
+          key: "Bearer"
+          value: {}
+        }
+      }
+    };
+  }
+}
+
+message GetHealthRequest {
+  // Empty request body
+}
+
+message GetHealthResponse {
+  // Health status of the service
+  string status = 1;
+}
+
+// OpenAPI options for the entire API.
+option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_swagger) = {
+  info: {
+    title: "Match Result Reconciliator API";
+    version: "1.0";
+  };
+  base_path: "/service";
+
+  security_definitions: {
+    security: {
+      key: "Bearer";
+      value: {
+        type: TYPE_API_KEY;
+        in: IN_HEADER;
+        name: "Authorization";
+      }
+    }
+  };
+};
