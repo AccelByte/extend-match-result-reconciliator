@@ -71,7 +71,6 @@ type AccelByteConfig struct {
 	ClientID     string `json:"clientID"`
 	ClientSecret string `json:"clientSecret"`
 	Namespace    string `json:"namespace"`
-	Enabled      bool   `json:"enabled"`
 }
 
 // LoadConfig loads configuration from environment variables
@@ -108,7 +107,6 @@ func LoadConfig() (*Config, error) {
 			ClientID:     getEnvOrDefault("AB_CLIENT_ID", ""),
 			ClientSecret: getEnvOrDefault("AB_CLIENT_SECRET", ""),
 			Namespace:    getEnvOrDefault("AB_NAMESPACE", common.GetNamespace()),
-			Enabled:      getEnvBoolOrDefault("AB_SESSION_VALIDATION_ENABLED", false),
 		},
 	}
 
@@ -155,20 +153,18 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid log format: %s, must be one of: %s", c.Log.Format, strings.Join(validLogFormats, ", "))
 	}
 
-	// Validate AccelByte configuration (only if enabled)
-	if c.AccelByte.Enabled {
-		if c.AccelByte.BaseURL == "" {
-			return fmt.Errorf("AccelByte base URL is required when session validation is enabled")
-		}
-		if c.AccelByte.ClientID == "" {
-			return fmt.Errorf("AccelByte client ID is required when session validation is enabled")
-		}
-		if c.AccelByte.ClientSecret == "" {
-			return fmt.Errorf("AccelByte client secret is required when session validation is enabled")
-		}
-		if c.AccelByte.Namespace == "" {
-			return fmt.Errorf("AccelByte namespace is required when session validation is enabled")
-		}
+	// Validate AccelByte configuration
+	if c.AccelByte.BaseURL == "" {
+		return fmt.Errorf("AccelByte base URL is required when session validation is enabled")
+	}
+	if c.AccelByte.ClientID == "" {
+		return fmt.Errorf("AccelByte client ID is required when session validation is enabled")
+	}
+	if c.AccelByte.ClientSecret == "" {
+		return fmt.Errorf("AccelByte client secret is required when session validation is enabled")
+	}
+	if c.AccelByte.Namespace == "" {
+		return fmt.Errorf("AccelByte namespace is required when session validation is enabled")
 	}
 
 	return nil
@@ -217,16 +213,6 @@ func getEnvDurationOrDefault(key string, defaultSeconds int) time.Duration {
 	return time.Duration(defaultSeconds) * time.Second
 }
 
-// getEnvBoolOrDefault returns the environment variable as bool or default
-func getEnvBoolOrDefault(key string, defaultValue bool) bool {
-	if value := os.Getenv(key); value != "" {
-		if boolVal, err := strconv.ParseBool(value); err == nil {
-			return boolVal
-		}
-	}
-	return defaultValue
-}
-
 // contains checks if a slice contains a string
 func contains(slice []string, item string) bool {
 	for _, s := range slice {
@@ -247,25 +233,24 @@ func GetRequiredEnvVars() []string {
 // GetOptionalEnvVars returns a list of optional environment variables with their defaults
 func GetOptionalEnvVars() map[string]string {
 	return map[string]string{
-		"KAFKA_TOPIC":                   common.GetNamespace() + ".match",
-		"KAFKA_GROUP_ID":                "reconciliator-group",
-		"KAFKA_MIN_BYTES":               "10240",
-		"KAFKA_MAX_BYTES":               "10485760",
-		"KAFKA_MAX_WAIT_SEC":            "1",
-		"REDIS_ADDR":                    "localhost:6379",
-		"REDIS_PASSWORD":                "",
-		"REDIS_DB":                      "0",
-		"REDIS_TTL_SECONDS":             "300", // 5 minutes
-		"LOG_LEVEL":                     "info",
-		"LOG_FORMAT":                    "json",
-		"SERVICE_NAME":                  "reconciliator",
-		"SERVICE_VERSION":               "1.0.0",
-		"ENVIRONMENT":                   "development",
-		"SHUTDOWN_TIMEOUT_SEC":          "30",
-		"AB_BASE_URL":                   "https://demo.accelbyte.io",
-		"AB_CLIENT_ID":                  "",
-		"AB_CLIENT_SECRET":              "",
-		"AB_NAMESPACE":                  common.GetNamespace(),
-		"AB_SESSION_VALIDATION_ENABLED": "false",
+		"KAFKA_TOPIC":          common.GetNamespace() + ".match",
+		"KAFKA_GROUP_ID":       "reconciliator-group",
+		"KAFKA_MIN_BYTES":      "10240",
+		"KAFKA_MAX_BYTES":      "10485760",
+		"KAFKA_MAX_WAIT_SEC":   "1",
+		"REDIS_ADDR":           "localhost:6379",
+		"REDIS_PASSWORD":       "",
+		"REDIS_DB":             "0",
+		"REDIS_TTL_SECONDS":    "300", // 5 minutes
+		"LOG_LEVEL":            "info",
+		"LOG_FORMAT":           "json",
+		"SERVICE_NAME":         "reconciliator",
+		"SERVICE_VERSION":      "1.0.0",
+		"ENVIRONMENT":          "development",
+		"SHUTDOWN_TIMEOUT_SEC": "30",
+		"AB_BASE_URL":          "https://demo.accelbyte.io",
+		"AB_CLIENT_ID":         "",
+		"AB_CLIENT_SECRET":     "",
+		"AB_NAMESPACE":         common.GetNamespace(),
 	}
 }

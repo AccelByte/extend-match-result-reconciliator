@@ -194,15 +194,11 @@ func NewService(logger *logrus.Logger, config *Config) *Service {
 		logger.Fatal("Failed to initialize Redis client")
 	}
 
-	// Initialize AccelByte SDK services (if enabled)
-	if config.AccelByte.Enabled {
-		if err := service.initAccelByteSDK(); err != nil {
-			logger.WithError(err).Fatal("Failed to initialize AccelByte SDK")
-		}
-		logger.Info("AccelByte SDK initialized successfully")
-	} else {
-		logger.Info("AccelByte SDK session validation is disabled")
+	// Initialize AccelByte SDK services
+	if err := service.initAccelByteSDK(); err != nil {
+		logger.WithError(err).Fatal("Failed to initialize AccelByte SDK")
 	}
+	logger.Info("AccelByte SDK initialized successfully")
 
 	return service
 }
@@ -576,24 +572,25 @@ func (s *Service) processMessage(ctx context.Context, msg kafka.Message) error {
 			"second_sender": matchResult.Sender,
 			"bit_flags":     comparisonResult.BitFlags,
 		}).Info("Session validation passed for inconsistent match results - corrected match result")
+	} else {
+
+		// TODO: Add more sophisticated handling for discrepancies
+		// For now, just log the differences
+		// Possible other discrepancies:
+		// - Winner mismatch
+		// - Start time mismatch
+		// - End time mismatch
+		// - Stats count mismatch
+		// - Player stats mismatch
+
+		s.logger.WithFields(logrus.Fields{
+			"match_id":      matchResult.MatchID,
+			"players":       matchResult.Players,
+			"first_sender":  existingResult.Sender,
+			"second_sender": matchResult.Sender,
+			"bit_flags":     comparisonResult.BitFlags,
+		}).Info("Skipping session validation - no player-related discrepancies detected")
 	}
-
-	// TODO: Add more sophisticated handling for discrepancies
-	// For now, just log the differences
-	// Possible other discrepancies:
-	// - Winner mismatch
-	// - Start time mismatch
-	// - End time mismatch
-	// - Stats count mismatch
-	// - Player stats mismatch
-
-	s.logger.WithFields(logrus.Fields{
-		"match_id":      matchResult.MatchID,
-		"players":       matchResult.Players,
-		"first_sender":  existingResult.Sender,
-		"second_sender": matchResult.Sender,
-		"bit_flags":     comparisonResult.BitFlags,
-	}).Info("Skipping session validation - no player-related discrepancies detected")
 
 	// Store match result in CloudSave for all players
 	if err := s.storeMatchResultInCloudSave(ctx, &matchResult); err != nil {
@@ -673,12 +670,6 @@ func (s *Service) validateSessionMembers(ctx context.Context, matchResult *commo
 		duration := time.Since(startTime).Seconds()
 		sessionValidationDuration.Observe(duration)
 	}()
-
-	// Check if session validation is enabled
-	if !s.config.AccelByte.Enabled {
-		sessionValidationsTotal.WithLabelValues("disabled").Inc()
-		return matchResult, nil
-	}
 
 	// Check if we have the required SDK services
 	if s.sessionService == nil {
@@ -814,12 +805,6 @@ type MatchResultHistory struct {
 // storeMatchResultInCloudSave stores the match result for all players in AccelByte CloudSave
 func (s *Service) storeMatchResultInCloudSave(ctx context.Context, matchResult *common.KafkaMatchResultMessage) error {
 	tracer := otel.Tracer("reconciliator")
-
-	// Check if CloudSave is enabled
-	if !s.config.AccelByte.Enabled {
-		s.logger.Debug("CloudSave is disabled, skipping match result storage")
-		return nil
-	}
 
 	// Check if we have the required SDK services
 	if s.adminPlayerRecordService == nil {
@@ -1025,11 +1010,6 @@ func (s *Service) updatePlayerStatistics(ctx context.Context, matchResult *commo
 		),
 	)
 	defer span.End()
-
-	if !s.config.AccelByte.Enabled {
-		s.logger.Debug("AccelByte integration disabled, skipping statistics update")
-		return nil
-	}
 
 	if s.userStatisticService == nil {
 		err := fmt.Errorf("user statistic service not initialized")
