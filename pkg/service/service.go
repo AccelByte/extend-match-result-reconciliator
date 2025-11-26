@@ -16,13 +16,9 @@ import (
 	"time"
 
 	"github.com/AccelByte/accelbyte-go-sdk/cloudsave-sdk/pkg/cloudsaveclient/admin_player_record"
-	"github.com/AccelByte/accelbyte-go-sdk/services-api/pkg/factory"
-	"github.com/AccelByte/accelbyte-go-sdk/services-api/pkg/repository"
 	"github.com/AccelByte/accelbyte-go-sdk/services-api/pkg/service/cloudsave"
-	"github.com/AccelByte/accelbyte-go-sdk/services-api/pkg/service/iam"
 	"github.com/AccelByte/accelbyte-go-sdk/services-api/pkg/service/session"
 	"github.com/AccelByte/accelbyte-go-sdk/services-api/pkg/service/social"
-	sdkAuth "github.com/AccelByte/accelbyte-go-sdk/services-api/pkg/utils/auth"
 	"github.com/AccelByte/accelbyte-go-sdk/session-sdk/pkg/sessionclient/game_session"
 	"github.com/AccelByte/accelbyte-go-sdk/social-sdk/pkg/socialclient/user_statistic"
 	"github.com/AccelByte/accelbyte-go-sdk/social-sdk/pkg/socialclientmodels"
@@ -122,26 +118,21 @@ var (
 // Service implements the reconciliator service
 type Service struct {
 	pb.UnimplementedServiceServer
-	logger      *logrus.Logger
-	kafkaReader *kafka.Reader
-	redisClient *redis.Client
-	ctx         context.Context
-	cancel      context.CancelFunc
-	metrics     *prometheus.Registry
-	config      *Config
-	namespace   string
-
-	// AccelByte SDK services
-	oauthService   *iam.OAuth20Service
-	sessionService *session.GameSessionService
-
-	// CloudSave services
+	logger                   *logrus.Logger
+	kafkaReader              *kafka.Reader
+	redisClient              *redis.Client
+	ctx                      context.Context
+	cancel                   context.CancelFunc
+	metrics                  *prometheus.Registry
+	config                   *Config
+	namespace                string
+	sessionService           *session.GameSessionService
 	adminPlayerRecordService *cloudsave.AdminPlayerRecordService
 	userStatisticService     *social.UserStatisticService
 }
 
 // NewService creates a new reconciliator service instance
-func NewService(logger *logrus.Logger, config *Config) *Service {
+func NewService(logger *logrus.Logger, config *Config, sessionService *session.GameSessionService, adminPlayerRecordService *cloudsave.AdminPlayerRecordService, userStatisticService *social.UserStatisticService) *Service {
 	if logger == nil {
 		logger = logrus.New()
 	}
@@ -170,12 +161,15 @@ func NewService(logger *logrus.Logger, config *Config) *Service {
 	)
 
 	service := &Service{
-		logger:    logger,
-		ctx:       ctx,
-		cancel:    cancel,
-		metrics:   metrics,
-		config:    config,
-		namespace: common.GetNamespace(),
+		logger:                   logger,
+		ctx:                      ctx,
+		cancel:                   cancel,
+		metrics:                  metrics,
+		config:                   config,
+		namespace:                common.GetNamespace(),
+		sessionService:           sessionService,
+		adminPlayerRecordService: adminPlayerRecordService,
+		userStatisticService:     userStatisticService,
 	}
 
 	// Initialize Kafka reader
@@ -193,12 +187,6 @@ func NewService(logger *logrus.Logger, config *Config) *Service {
 	} else {
 		logger.Fatal("Failed to initialize Redis client")
 	}
-
-	// Initialize AccelByte SDK services
-	if err := service.initAccelByteSDK(); err != nil {
-		logger.WithError(err).Fatal("Failed to initialize AccelByte SDK")
-	}
-	logger.Info("AccelByte SDK initialized successfully")
 
 	return service
 }
@@ -273,53 +261,6 @@ func (s *Service) initRedisClient() *redis.Client {
 	}
 
 	return rdb
-}
-
-// initAccelByteSDK initializes the AccelByte SDK services
-func (s *Service) initAccelByteSDK() error {
-	// Create config repository (reads from environment variables)
-	var configRepo repository.ConfigRepository = sdkAuth.DefaultConfigRepositoryImpl()
-
-	// Create token repository
-	var tokenRepo repository.TokenRepository = sdkAuth.DefaultTokenRepositoryImpl()
-
-	// Create refresh token repository
-	var refreshRepo repository.RefreshTokenRepository = &sdkAuth.RefreshTokenImpl{RefreshRate: 0.8, AutoRefresh: true}
-
-	// Initialize OAuth service
-	s.oauthService = &iam.OAuth20Service{
-		Client:                 factory.NewIamClient(configRepo),
-		ConfigRepository:       configRepo,
-		TokenRepository:        tokenRepo,
-		RefreshTokenRepository: refreshRepo,
-	}
-
-	// Login using client credentials
-	clientId := configRepo.GetClientId()
-	clientSecret := configRepo.GetClientSecret()
-	if err := s.oauthService.LoginClient(&clientId, &clientSecret); err != nil {
-		return fmt.Errorf("failed to login with AccelByte client credentials: %w", err)
-	}
-
-	// Initialize Session service
-	s.sessionService = &session.GameSessionService{
-		Client:          factory.NewSessionClient(configRepo),
-		TokenRepository: tokenRepo,
-	}
-
-	// Initialize CloudSave services
-	s.adminPlayerRecordService = &cloudsave.AdminPlayerRecordService{
-		Client:          factory.NewCloudsaveClient(configRepo),
-		TokenRepository: tokenRepo,
-	}
-
-	// Initialize UserStatistic service
-	s.userStatisticService = &social.UserStatisticService{
-		Client:          factory.NewSocialClient(configRepo),
-		TokenRepository: tokenRepo,
-	}
-
-	return nil
 }
 
 // GetMetricsRegistry returns the service's metrics registry
