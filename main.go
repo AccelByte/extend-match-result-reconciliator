@@ -24,7 +24,10 @@ import (
 
 	"github.com/AccelByte/accelbyte-go-sdk/services-api/pkg/factory"
 	"github.com/AccelByte/accelbyte-go-sdk/services-api/pkg/repository"
+	"github.com/AccelByte/accelbyte-go-sdk/services-api/pkg/service/cloudsave"
 	"github.com/AccelByte/accelbyte-go-sdk/services-api/pkg/service/iam"
+	"github.com/AccelByte/accelbyte-go-sdk/services-api/pkg/service/session"
+	"github.com/AccelByte/accelbyte-go-sdk/services-api/pkg/service/social"
 	sdkAuth "github.com/AccelByte/accelbyte-go-sdk/services-api/pkg/utils/auth"
 	"github.com/go-openapi/loads"
 	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/logging"
@@ -139,8 +142,24 @@ func main() {
 		logrus.Fatalf("Error unable to login using clientId and clientSecret: %v", err)
 	}
 
+	// Initialize AccelByte SDK services
+	sessionService := &session.GameSessionService{
+		Client:          factory.NewSessionClient(configRepo),
+		TokenRepository: tokenRepo,
+	}
+
+	adminPlayerRecordService := &cloudsave.AdminPlayerRecordService{
+		Client:          factory.NewCloudsaveClient(configRepo),
+		TokenRepository: tokenRepo,
+	}
+
+	userStatisticService := &social.UserStatisticService{
+		Client:          factory.NewSocialClient(configRepo),
+		TokenRepository: tokenRepo,
+	}
+
 	// Register Guild Service
-	myServiceServer := service.NewService(logrusLogger, config)
+	myServiceServer := service.NewService(logrusLogger, config, sessionService, adminPlayerRecordService, userStatisticService)
 	pb.RegisterServiceServer(s, myServiceServer)
 
 	// Enable gRPC Reflection
