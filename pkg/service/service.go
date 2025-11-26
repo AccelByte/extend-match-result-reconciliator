@@ -283,11 +283,15 @@ func (s *Service) initAccelByteSDK() error {
 	// Create token repository
 	var tokenRepo repository.TokenRepository = sdkAuth.DefaultTokenRepositoryImpl()
 
+	// Create refresh token repository
+	var refreshRepo repository.RefreshTokenRepository = &sdkAuth.RefreshTokenImpl{RefreshRate: 0.8, AutoRefresh: true}
+
 	// Initialize OAuth service
 	s.oauthService = &iam.OAuth20Service{
-		Client:           factory.NewIamClient(configRepo),
-		ConfigRepository: configRepo,
-		TokenRepository:  tokenRepo,
+		Client:                 factory.NewIamClient(configRepo),
+		ConfigRepository:       configRepo,
+		TokenRepository:        tokenRepo,
+		RefreshTokenRepository: refreshRepo,
 	}
 
 	// Login using client credentials
